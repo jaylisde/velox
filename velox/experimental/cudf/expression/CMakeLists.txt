@@ -12,11 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+add_library(velox_cudf_expression_registry ExpressionEvaluatorRegistry.cpp)
+
+target_link_libraries(
+  velox_cudf_expression_registry
+  PUBLIC cudf::cudf
+  PRIVATE velox_exception velox_common_base
+)
+
 add_library(
   velox_cudf_expression
   AstExpression.cpp
   DecimalExpressionKernels.cu
   ExpressionEvaluator.cpp
+  CudfExpressionCompiler.cpp
   JitExpression.cpp
   PrestoFunctions.cpp
   SparkFunctions.cpp
@@ -27,7 +36,7 @@ add_library(
 target_link_libraries(
   velox_cudf_expression
   PUBLIC cudf::cudf
-  PRIVATE arrow velox_exception velox_common_base velox_cudf_vector
+  PRIVATE arrow velox_exception velox_common_base velox_cudf_vector velox_cudf_expression_registry velox_expression
 )
 
 target_compile_options(velox_cudf_expression PRIVATE -Wno-missing-field-initializers)

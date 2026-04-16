@@ -13,17 +13,22 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 #pragma once
 
-#include "velox/core/Expressions.h"
-#include "velox/expression/Expr.h"
+namespace facebook::velox::core {
+class QueryCtx;
+} // namespace facebook::velox::core
+
+namespace facebook::velox::memory {
+class MemoryPool;
+} // namespace facebook::velox::memory
 
 namespace facebook::velox::cudf_velox {
 
-bool containsDecimalType(
-    const std::shared_ptr<velox::exec::Expr>& expr,
-    const bool deep);
-
-bool containsDecimalType(const core::TypedExprPtr& expr, const bool deep);
+struct CudfExprCtx {
+  core::QueryCtx* queryCtx;
+  memory::MemoryPool* pool;
+};
 
 } // namespace facebook::velox::cudf_velox

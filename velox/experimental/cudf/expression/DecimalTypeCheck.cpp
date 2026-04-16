@@ -22,9 +22,36 @@ bool isOfDecimalType(const std::shared_ptr<velox::exec::Expr>& expr) {
   return expr && expr->type() && expr->type()->isDecimal();
 }
 
+bool isOfDecimalType(const core::TypedExprPtr& expr) {
+  return expr && expr->type() && expr->type()->isDecimal();
+}
+
 bool containsDecimalType(
     const std::shared_ptr<velox::exec::Expr>& expr,
     const bool deep) {
+  // check output type
+  if (isOfDecimalType(expr)) {
+    return true;
+  }
+  if (deep) {
+    // check recursively
+    for (const auto& input : expr->inputs()) {
+      if (containsDecimalType(input, true)) {
+        return true;
+      }
+    }
+  } else {
+    // only check immediate inputs
+    for (const auto& input : expr->inputs()) {
+      if (isOfDecimalType(input)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool containsDecimalType(const core::TypedExprPtr& expr, const bool deep) {
   // check output type
   if (isOfDecimalType(expr)) {
     return true;

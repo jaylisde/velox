@@ -546,6 +546,28 @@ TEST_F(E2EFilterTest, stringDeltaByteArray) {
       20);
 }
 
+TEST_F(E2EFilterTest, longDecimalDeltaByteArray) {
+  options_.enableDictionary = false;
+  options_.dataPageSize = 4 * 1024;
+  options_.encoding =
+      facebook::velox::parquet::arrow::Encoding::kDeltaByteArray;
+
+  for (const auto& type : {
+           "longdecimal_val:decimal(30, 10)",
+           "longdecimal_val:decimal(37, 15)",
+       }) {
+    testWithTypes(
+        type,
+        [&]() {
+          makeIntDistribution<int128_t>(
+              "longdecimal_val", 10, 100, 22, 19, -999, 30000, true);
+        },
+        true,
+        {"longdecimal_val"},
+        20);
+  }
+}
+
 TEST_F(E2EFilterTest, dedictionarize) {
   rowsInRowGroup_ = 10'000;
   options_.dictionaryPageSizeLimit = 20'000;

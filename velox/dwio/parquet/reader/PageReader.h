@@ -286,6 +286,10 @@ class PageReader {
       } else if (encoding_ == thrift::Encoding::DELTA_BINARY_PACKED) {
         nullsFromFastPath = false;
         deltaBpDecoder_->readWithVisitor<true>(nulls, visitor);
+      } else if (encoding_ == thrift::Encoding::DELTA_BYTE_ARRAY) {
+        nullsFromFastPath = false;
+        deltaByteArrFixedDecoder_->readWithVisitorFixedWidth<true>(
+            nulls, visitor, type_->typeLength_);
       } else {
         directDecoder_->readWithVisitor<true>(
             nulls, visitor, nullsFromFastPath);
@@ -296,6 +300,9 @@ class PageReader {
         dictionaryIdDecoder_->readWithVisitor<false>(nullptr, dictVisitor);
       } else if (encoding_ == thrift::Encoding::DELTA_BINARY_PACKED) {
         deltaBpDecoder_->readWithVisitor<false>(nulls, visitor);
+      } else if (encoding_ == thrift::Encoding::DELTA_BYTE_ARRAY) {
+        deltaByteArrFixedDecoder_->readWithVisitorFixedWidth<false>(
+            nulls, visitor, type_->typeLength_);
       } else {
         directDecoder_->readWithVisitor<false>(
             nulls, visitor, !this->type_->type()->isShortDecimal());
@@ -521,7 +528,8 @@ class PageReader {
   std::unique_ptr<StringDecoder> stringDecoder_;
   std::unique_ptr<BooleanDecoder> booleanDecoder_;
   std::unique_ptr<DeltaBpDecoder> deltaBpDecoder_;
-  std::unique_ptr<DeltaByteArrayDecoder> deltaByteArrDecoder_;
+  std::unique_ptr<DeltaByteArrayDecoder<false>> deltaByteArrDecoder_;
+  std::unique_ptr<DeltaByteArrayDecoder<true>> deltaByteArrFixedDecoder_;
   std::unique_ptr<RleBpDataDecoder> rleBooleanDecoder_;
   // Add decoders for other encodings here.
 };

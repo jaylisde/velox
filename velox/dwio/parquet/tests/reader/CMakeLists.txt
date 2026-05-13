@@ -97,6 +97,19 @@ if(VELOX_ENABLE_BENCHMARKS)
     Folly::folly
     Folly::follybenchmark
   )
+
+  add_executable(velox_dwio_parquet_delta_bp_decoder_test DeltaBpDecoderTest.cpp)
+  target_link_libraries(
+    velox_dwio_parquet_delta_bp_decoder_test
+    velox_dwio_native_parquet_reader
+    GTest::gtest
+    GTest::gtest_main
+  )
+  add_test(
+    NAME velox_dwio_parquet_delta_bp_decoder_test
+    COMMAND velox_dwio_parquet_delta_bp_decoder_test
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  )
 endif()
 
 add_executable(velox_dwio_parquet_table_scan_test ParquetTableScanTest.cpp)

@@ -204,12 +204,20 @@ class DeltaBpDecoder {
     uint64_t consumedBits =
         (valuesPerMiniBlock_ - valuesRemainingCurrentMiniBlock_) *
         deltaBitWidth_;
-    bits::copyBits(
-        reinterpret_cast<const uint64_t*>(bufferStart_),
-        consumedBits,
-        reinterpret_cast<uint64_t*>(&value),
-        0,
-        deltaBitWidth_);
+    // Inline bit extraction: faster than bits::copyBits for single-value
+    // reads since output offset is always 0 and deltaBitWidth_ <= 64.
+    if (deltaBitWidth_) {
+      const auto byteOffset = consumedBits / 8;
+      const auto bitOffset = consumedBits & 7;
+      auto word = folly::loadUnaligned<uint64_t>(bufferStart_ + byteOffset);
+      value = (word >> bitOffset);
+      if (bitOffset + deltaBitWidth_ > 64) {
+        auto nextByte = static_cast<uint64_t>(
+            static_cast<uint8_t>(bufferStart_[byteOffset + 8]));
+        value |= (nextByte << (64 - bitOffset));
+      }
+      value &= (~0ULL >> (64 - deltaBitWidth_));
+    }
     // Addition between minDelta_, packed int and lastValue_ should be treated
     // as unsigned addition. Overflow is as expected.
     value = static_cast<uint64_t>(minDelta_) + static_cast<uint64_t>(value) +

@@ -1620,6 +1620,82 @@ TEST_F(ParquetTableScanTest, deltaBinaryPackedNarrowBitWidth) {
   run.template operator()<int64_t>();
 }
 
+TEST_F(ParquetTableScanTest, deltaBinaryPackedBitWidth32) {
+  // Deltas alternating between 0 and 2^32-1 force packed bit_width = 32,
+  // the upper boundary of dwio::common::unpack<uint32_t>.
+  WriterOptions options;
+  options.enableDictionary = false;
+  options.encoding =
+      facebook::velox::parquet::arrow::Encoding::kDeltaBinaryPacked;
+
+  constexpr vector_size_t kSize = 1024;
+  constexpr int64_t kStep = (1LL << 32) - 1;
+  auto vector = makeRowVector(
+      {"c"}, {makeFlatVector<int64_t>(kSize, [](auto row) {
+        return static_cast<int64_t>((row / 2) * kStep + (row % 2 ? kStep : 0));
+      })});
+  auto file = TempFilePath::create();
+  writeToParquetFile(file->getPath(), {vector}, options);
+  loadData(vector->rowType(), vector);
+
+  assertSelect({makeSplit(file->getPath())}, {"c"}, "SELECT c FROM tmp");
+}
+
+TEST_F(ParquetTableScanTest, deltaBinaryPackedBitWidth33) {
+  // Deltas alternating between 0 and 2^32 force packed bit_width = 33,
+  // just past the 32-bit boundary; readLong must fall back to the
+  // per-row loadBits path.
+  WriterOptions options;
+  options.enableDictionary = false;
+  options.encoding =
+      facebook::velox::parquet::arrow::Encoding::kDeltaBinaryPacked;
+
+  constexpr vector_size_t kSize = 1024;
+  constexpr int64_t kStep = 1LL << 32;
+  auto vector = makeRowVector(
+      {"c"}, {makeFlatVector<int64_t>(kSize, [](auto row) {
+        return static_cast<int64_t>((row / 2) * kStep + (row % 2 ? kStep : 0));
+      })});
+  auto file = TempFilePath::create();
+  writeToParquetFile(file->getPath(), {vector}, options);
+  loadData(vector->rowType(), vector);
+
+  assertSelect({makeSplit(file->getPath())}, {"c"}, "SELECT c FROM tmp");
+}
+
+TEST_F(ParquetTableScanTest, deltaBinaryPackedMixedMiniblockWidths) {
+  // Within one block, the four miniblocks each pick a different bit_width
+  // (1, 8, 16, 24). Verifies that scratch is invalidated and refilled when
+  // the decoder transitions across miniblocks with differing widths.
+  WriterOptions options;
+  options.enableDictionary = false;
+  options.encoding =
+      facebook::velox::parquet::arrow::Encoding::kDeltaBinaryPacked;
+
+  constexpr vector_size_t kSize = 128;
+  auto vector = makeRowVector(
+      {"c"}, {makeFlatVector<int64_t>(kSize, [](auto row) {
+        auto deltaForRow = [](vector_size_t r) -> int64_t {
+          const int mb = (r / 32) % 4;
+          const int parity = r % 2;
+          if (mb == 0) return parity;
+          if (mb == 1) return parity ? 200LL : 0LL;
+          if (mb == 2) return parity ? 50'000LL : 0LL;
+          return parity ? 12'000'000LL : 0LL;
+        };
+        int64_t v = 0;
+        for (vector_size_t i = 0; i < row; ++i) {
+          v += deltaForRow(i);
+        }
+        return v;
+      })});
+  auto file = TempFilePath::create();
+  writeToParquetFile(file->getPath(), {vector}, options);
+  loadData(vector->rowType(), vector);
+
+  assertSelect({makeSplit(file->getPath())}, {"c"}, "SELECT c FROM tmp");
+}
+
 TEST_F(ParquetTableScanTest, deltaBinaryPackedWideAndNegative) {
   WriterOptions options;
   options.enableDictionary = false;

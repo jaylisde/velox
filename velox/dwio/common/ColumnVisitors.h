@@ -408,6 +408,85 @@ class ColumnVisitor {
   inline void addNull();
   inline void addOutputRow(vector_size_t row);
 
+  // Bulk-process numInput already-decoded values. Equivalent to calling
+  // process() numInput times in a row but batches the work so callers
+  // (decoders) can produce a run of values at once.
+  //
+  // Fast paths handled here:
+  //   - dense + AlwaysTrue + NoHook + scatter=false: bump counters only
+  //     (caller already wrote the values into values+numValues).
+  //   - dense + deterministic numeric filter + NoHook + scatter=false:
+  //     SIMD batch filter via dwio::common::processFixedFilter, which
+  //     handles all-pass / all-fail / partial-pass via bitmask.
+  // Anything outside those falls back to a per-row process() loop.
+  template <bool hasFilter, bool hasHook, bool scatter>
+  FOLLY_ALWAYS_INLINE void processRun(
+      const T* input,
+      int32_t numInput,
+      const int32_t* scatterRows,
+      int32_t* filterHits,
+      T* values,
+      int32_t& numValues) {
+    DCHECK_EQ(input, values + numValues);
+    if constexpr (
+        !hasFilter && !hasHook && !scatter && isDense &&
+        std::is_same_v<TFilter, velox::common::AlwaysTrue>) {
+      rowIndex_ += numInput;
+      numValues += numInput;
+      return;
+    }
+    if constexpr (
+        hasFilter && !hasHook && !scatter &&
+        TFilter::deterministic &&
+        (std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t> ||
+         std::is_same_v<T, int16_t>)) {
+      // Treat the caller-provided run as physically contiguous (the DELTA
+      // decoder's batched fast path detects contiguous rows even when
+      // isDense is false). currentRow() returns rowAt(rowIndex_), which
+      // is rowIndex_ for dense visitors and rows[rowIndex_] for sparse
+      // visitors that happen to start a contiguous run.
+      const int32_t firstRow = currentRow();
+      constexpr int32_t kWidth = xsimd::batch<T>::size;
+      int32_t i = 0;
+      while (i + kWidth <= numInput) {
+        auto batch = xsimd::load_unaligned(input + i);
+        ::facebook::velox::dwio::common::processFixedFilter<
+            T,
+            /*filterOnly=*/false,
+            /*scatter=*/false,
+            /*dense=*/true>(
+            batch,
+            kWidth,
+            firstRow + i,
+            filter_,
+            [&](int32_t /*offset*/) {
+              return ::facebook::velox::simd::loadGatherIndices<T>(
+                  rows_ + rowIndex_ + i);
+            },
+            values,
+            filterHits,
+            numValues);
+        i += kWidth;
+      }
+      rowIndex_ += i;
+      bool atEnd = false;
+      for (; i < numInput; ++i) {
+        process(input[i], atEnd);
+        if (atEnd) {
+          return;
+        }
+      }
+      return;
+    }
+    bool atEnd = false;
+    for (int32_t i = 0; i < numInput; ++i) {
+      process(input[i], atEnd);
+      if (atEnd) {
+        return;
+      }
+    }
+  }
+
   const TFilter& filter() {
     return filter_;
   }

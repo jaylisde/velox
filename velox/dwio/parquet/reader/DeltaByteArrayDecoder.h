@@ -22,18 +22,32 @@
 
 namespace facebook::velox::parquet {
 
-class DeltaByteArrayDecoderBase {
+// DeltaLengthByteArrayDecoder is adapted from Apache Arrow:
+// https://github.com/apache/arrow/blob/apache-arrow-15.0.0/cpp/src/parquet/encoding.cc#L2758-L2889
+class DeltaLengthByteArrayDecoder {
  public:
-  virtual ~DeltaByteArrayDecoderBase() = default;
+  explicit DeltaLengthByteArrayDecoder(const char* start) {
+    lengthDecoder_ = std::make_unique<DeltaBpDecoder>(start);
+    decodeLengths();
+    bufferStart_ = lengthDecoder_->bufferStart();
+  }
 
-  virtual std::string_view readString() = 0;
+  FOLLY_ALWAYS_INLINE std::string_view readString() {
+    const int64_t length = bufferedLength_[lengthIdx_++];
+    VELOX_CHECK_GE(length, 0, "negative string delta length");
+    bufferStart_ += length;
+    return std::string_view(bufferStart_ - length, length);
+  }
 
   void skip(uint64_t numValues) {
     skip<false>(numValues, 0, nullptr);
   }
 
   template <bool hasNulls>
-  inline void skip(int32_t numValues, int32_t current, const uint64_t* nulls) {
+  FOLLY_ALWAYS_INLINE void skip(
+      int32_t numValues,
+      int32_t current,
+      const uint64_t* nulls) {
     if (hasNulls) {
       numValues = bits::countNonNulls(nulls, current, current + numValues);
     }
@@ -76,24 +90,6 @@ class DeltaByteArrayDecoderBase {
       }
     }
   }
-};
-
-// DeltaByteArrayDecoder is adapted from Apache Arrow:
-// https://github.com/apache/arrow/blob/apache-arrow-15.0.0/cpp/src/parquet/encoding.cc#L2758-L2889
-class DeltaLengthByteArrayDecoder : public DeltaByteArrayDecoderBase {
- public:
-  explicit DeltaLengthByteArrayDecoder(const char* start) {
-    lengthDecoder_ = std::make_unique<DeltaBpDecoder>(start);
-    decodeLengths();
-    bufferStart_ = lengthDecoder_->bufferStart();
-  }
-
-  std::string_view readString() override {
-    const int64_t length = bufferedLength_[lengthIdx_++];
-    VELOX_CHECK_GE(length, 0, "negative string delta length");
-    bufferStart_ += length;
-    return std::string_view(bufferStart_ - length, length);
-  }
 
  private:
   void decodeLengths() {
@@ -115,7 +111,7 @@ class DeltaLengthByteArrayDecoder : public DeltaByteArrayDecoderBase {
 
 // DeltaByteArrayDecoder is adapted from Apache Arrow:
 // https://github.com/apache/arrow/blob/apache-arrow-15.0.0/cpp/src/parquet/encoding.cc#L3301-L3545
-class DeltaByteArrayDecoder : public DeltaByteArrayDecoderBase {
+class DeltaByteArrayDecoder {
  public:
   explicit DeltaByteArrayDecoder(const char* start) {
     prefixLenDecoder_ = std::make_unique<DeltaBpDecoder>(start);
@@ -130,59 +126,95 @@ class DeltaByteArrayDecoder : public DeltaByteArrayDecoderBase {
         prefixLenDecoder_->bufferStart());
   }
 
-  std::string_view readString() override {
+  FOLLY_ALWAYS_INLINE std::string_view readString() {
     auto suffix = suffixDecoder_->readString();
-    bool isFirstRun = (prefixLenOffset_ == 0);
     const int64_t prefixLength = bufferedPrefixLength_[prefixLenOffset_++];
 
     VELOX_CHECK_GE(
         prefixLength, 0, "negative prefix length in DELTA_BYTE_ARRAY");
-
-    buildReadValue(isFirstRun, prefixLength, suffix);
-
-    numValidValues_--;
-    return {lastValue_};
-  }
-
- private:
-  void buildReadValue(
-      bool isFirstRun,
-      const int64_t prefixLength,
-      std::string_view suffix) {
     VELOX_CHECK_LE(
         prefixLength,
-        lastValue_.size(),
+        lastValueLen_,
         "prefix length too large in DELTA_BYTE_ARRAY");
 
-    if (prefixLength == 0) {
-      // prefix is empty.
-      lastValue_ = std::string{suffix};
-      return;
+    // Append suffix bytes after the kept prefix in lastValueBuf_, growing
+    // the buffer if needed. lastValueBuf_ persists across calls and
+    // amortizes allocation.
+    const size_t need = prefixLength + suffix.size();
+    if (need > lastValueBuf_.size()) {
+      lastValueBuf_.resize(need);
     }
+    if (!suffix.empty()) {
+      memcpy(lastValueBuf_.data() + prefixLength, suffix.data(), suffix.size());
+    }
+    lastValueLen_ = static_cast<int32_t>(need);
 
-    if (!isFirstRun) {
-      if (suffix.empty()) {
-        // suffix is empty: read value can simply point to the prefix
-        // of the lastValue_. This is not possible for the first run since
-        // the prefix would point to the mutable `lastValue_`.
-        lastValue_ = lastValue_.substr(0, prefixLength);
+    numValidValues_--;
+    return {lastValueBuf_.data(), static_cast<size_t>(lastValueLen_)};
+  }
+
+  void skip(uint64_t numValues) {
+    skip<false>(numValues, 0, nullptr);
+  }
+
+  template <bool hasNulls>
+  FOLLY_ALWAYS_INLINE void skip(
+      int32_t numValues,
+      int32_t current,
+      const uint64_t* nulls) {
+    if (hasNulls) {
+      numValues = bits::countNonNulls(nulls, current, current + numValues);
+    }
+    for (int32_t i = 0; i < numValues; ++i) {
+      readString();
+    }
+  }
+
+  template <bool hasNulls, typename Visitor>
+  void readWithVisitor(const uint64_t* nulls, Visitor visitor) {
+    int32_t current = visitor.start();
+    skip<hasNulls>(current, 0, nulls);
+    int32_t toSkip;
+    bool atEnd = false;
+    const bool allowNulls = hasNulls && visitor.allowNulls();
+    for (;;) {
+      if (hasNulls && allowNulls && bits::isBitNull(nulls, current)) {
+        toSkip = visitor.processNull(atEnd);
+      } else {
+        if (hasNulls && !allowNulls) {
+          toSkip = visitor.checkAndSkipNulls(nulls, current, atEnd);
+          if (!Visitor::dense) {
+            skip<false>(toSkip, current, nullptr);
+          }
+          if (atEnd) {
+            return;
+          }
+        }
+
+        // We are at a non-null value on a row to visit.
+        toSkip = visitor.process(readString(), atEnd);
+      }
+      ++current;
+      if (toSkip) {
+        skip<hasNulls>(toSkip, current, nulls);
+        current += toSkip;
+      }
+      if (atEnd) {
         return;
       }
     }
-
-    lastValue_.resize(prefixLength + suffix.size());
-
-    // Both prefix and suffix are non-empty, so we need to decode the string
-    // into read value.
-    // Just keep the prefix in lastValue_, and copy the suffix.
-    memcpy(lastValue_.data() + prefixLength, suffix.data(), suffix.size());
   }
 
+ private:
   std::unique_ptr<DeltaBpDecoder> prefixLenDecoder_;
   std::unique_ptr<DeltaBpDecoder> suffixLenDecoder_;
   std::unique_ptr<DeltaLengthByteArrayDecoder> suffixDecoder_;
 
-  std::string lastValue_;
+  // Reconstructed value of the most recently returned string. The
+  // returned string_view aliases this buffer; the next call to
+  // readString() overwrites it.
+  std::vector<char> lastValueBuf_;
+  int32_t lastValueLen_{0};
   int32_t numValidValues_{0};
   uint32_t prefixLenOffset_{0};
   std::vector<uint32_t> bufferedPrefixLength_;

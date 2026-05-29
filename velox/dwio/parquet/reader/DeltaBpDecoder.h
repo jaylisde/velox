@@ -36,7 +36,10 @@ class DeltaBpDecoder {
   }
 
   template <bool hasNulls>
-  inline void skip(int32_t numValues, int32_t current, const uint64_t* nulls) {
+  FOLLY_ALWAYS_INLINE void skip(
+      int32_t numValues,
+      int32_t current,
+      const uint64_t* nulls) {
     if (hasNulls) {
       numValues = bits::countNonNulls(nulls, current, current + numValues);
     }
@@ -49,6 +52,28 @@ class DeltaBpDecoder {
   void readWithVisitor(const uint64_t* nulls, Visitor visitor) {
     int32_t current = visitor.start();
     skip<hasNulls>(current, 0, nulls);
+    if constexpr (
+        !hasNulls &&
+        Visitor::FilterType::deterministic &&
+        std::is_same_v<
+            typename Visitor::HookType,
+            dwio::common::NoHook> &&
+        std::is_integral_v<typename Visitor::DataType>) {
+      // Detect at runtime whether the row range is actually contiguous
+      // (rows[i] == rows[0]+i) even when the visitor's static isDense
+      // flag is false. Contiguous + filtered scans are the common case
+      // after a prior filter pushdown.
+      auto* r = visitor.rows();
+      const int32_t n = visitor.numRows();
+      bool contiguous = (n > 0);
+      if (n > 1) {
+        contiguous = (r[n - 1] - r[0] + 1) == n;
+      }
+      if (Visitor::dense || contiguous) {
+        readWithVisitorDenseBatched(visitor);
+        return;
+      }
+    }
     int32_t toSkip;
     bool atEnd = false;
     const bool allowNulls = hasNulls && visitor.allowNulls();
@@ -89,14 +114,127 @@ class DeltaBpDecoder {
   }
 
   template <typename T>
-  void readValues(T* values, int32_t numValues) {
+  FOLLY_ALWAYS_INLINE void readValues(T* values, int32_t numValues) {
     VELOX_DCHECK_LE(numValues, totalValuesRemaining_);
-    for (auto i = 0; i < numValues; i++) {
-      values[i] = T(readLong());
+    if constexpr (std::is_integral_v<T>) {
+      decodeLongs(values, numValues);
+    } else {
+      for (auto i = 0; i < numValues; i++) {
+        values[i] = T(readLong());
+      }
     }
   }
 
  private:
+  // Dense + deterministic-filter + NoHook + integral DataType fast path.
+  // Decodes a chunk of rows directly into the visitor's output buffer,
+  // then dispatches a single visitor.processRun() per chunk instead of
+  // one visitor.process() per row. The processRun() entry handles both
+  // AlwaysTrue (no-op filter) and deterministic numeric filters via
+  // SIMD batch filter.
+  //
+  // The inner decode loop is a manually-inlined readLong() with the hot
+  // decoder state hoisted to local variables so the loop avoids member
+  // store/load round-trips on every iteration (TPC-H Q12 perf showed
+  // ~28% of cycles on the store to totalValuesRemaining_ alone before
+  // hoisting).
+  template <typename Visitor>
+  void readWithVisitorDenseBatched(Visitor& visitor) {
+    using DataType = typename Visitor::DataType;
+    constexpr bool kHasFilter = !std::is_same_v<
+        typename Visitor::FilterType,
+        velox::common::AlwaysTrue>;
+    constexpr int32_t kBatch = 256;
+    const int32_t total = visitor.numRows();
+    DataType* output = visitor.rawValues(total);
+    int32_t* filterHits = kHasFilter ? visitor.outputRows(total) : nullptr;
+    int32_t numValues = 0;
+    int32_t consumed = 0;
+    while (consumed < total) {
+      const int32_t n = std::min<int32_t>(kBatch, total - consumed);
+      DataType* dst = output + numValues;
+      decodeLongs(dst, n);
+      visitor.template processRun<kHasFilter, /*hasHook=*/false, /*scatter=*/false>(
+          dst,
+          n,
+          /*scatterRows=*/nullptr,
+          filterHits,
+          output,
+          numValues);
+      consumed += n;
+    }
+    visitor.setNumValues(numValues);
+  }
+
+  // Decode `n` consecutive int64 values into `out[0..n)`, manually
+  // inlining readLong() with hoisted state to keep the inner loop
+  // entirely in registers. `out` is a typed pointer (DataType); the
+  // narrowing static_cast at the store covers int32 as well as int64.
+  //
+  // Maintains a running bitOffset (instead of recomputing
+  // valuesConsumed * bitWidth each row) so that the inner loop avoids a
+  // multiply per row.
+  template <typename DataType>
+  void decodeLongs(DataType* out, int32_t n) {
+    const char* bufStart = bufferStart_;
+    uint64_t valsPerMiniBlk = valuesPerMiniBlock_;
+    uint64_t miniBlockRemaining = valuesRemainingCurrentMiniBlock_;
+    uint64_t totalRemaining = totalValuesRemaining_;
+    int64_t lastValue = lastValue_;
+    int64_t minDelta = minDelta_;
+    uint64_t deltaBitWidth = deltaBitWidth_;
+    uint64_t bitOffset =
+        (valsPerMiniBlk - miniBlockRemaining) * deltaBitWidth;
+
+    int32_t i = 0;
+    while (i < n) {
+      if (miniBlockRemaining == 0) {
+        bufferStart_ = bufStart;
+        valuesRemainingCurrentMiniBlock_ = 0;
+        totalValuesRemaining_ = totalRemaining;
+        lastValue_ = lastValue;
+        int64_t v = readLong();
+        out[i] = static_cast<DataType>(v);
+        bufStart = bufferStart_;
+        miniBlockRemaining = valuesRemainingCurrentMiniBlock_;
+        totalRemaining = totalValuesRemaining_;
+        lastValue = lastValue_;
+        minDelta = minDelta_;
+        deltaBitWidth = deltaBitWidth_;
+        bitOffset =
+            (valsPerMiniBlk - miniBlockRemaining) * deltaBitWidth;
+        ++i;
+        continue;
+      }
+
+      uint64_t value = 0;
+      if (deltaBitWidth) {
+        value = bits::detail::loadBits<uint64_t>(
+            reinterpret_cast<const uint64_t*>(bufStart),
+            bitOffset,
+            deltaBitWidth);
+        value &= (~0ULL >> (64 - deltaBitWidth));
+      }
+      uint64_t result = static_cast<uint64_t>(minDelta) + value +
+          static_cast<uint64_t>(lastValue);
+      lastValue = static_cast<int64_t>(result);
+      out[i] = static_cast<DataType>(result);
+      bitOffset += deltaBitWidth;
+      --miniBlockRemaining;
+      --totalRemaining;
+      if (miniBlockRemaining == 0 || totalRemaining == 0) {
+        bufStart += bits::nbytes(deltaBitWidth * valsPerMiniBlk);
+        bitOffset = 0;
+      }
+      ++i;
+    }
+
+    bufferStart_ = bufStart;
+    valuesRemainingCurrentMiniBlock_ = miniBlockRemaining;
+    totalValuesRemaining_ = totalRemaining;
+    lastValue_ = lastValue;
+  }
+
   bool getVlqInt(uint64_t& v) {
     uint64_t tmp = 0;
     for (int i = 0; i < folly::kMaxVarintLength64; i++) {
@@ -177,7 +315,7 @@ class DeltaBpDecoder {
     valuesRemainingCurrentMiniBlock_ = valuesPerMiniBlock_;
   }
 
-  int64_t readLong() {
+  FOLLY_ALWAYS_INLINE int64_t readLong() {
     int64_t value = 0;
     if (valuesRemainingCurrentMiniBlock_ == 0) {
       if (!firstBlockInitialized_) {

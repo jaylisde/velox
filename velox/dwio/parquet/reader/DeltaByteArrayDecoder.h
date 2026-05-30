@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <optional>
+
 #include "velox/common/base/BitUtil.h"
 #include "velox/common/base/Nulls.h"
 #include "velox/dwio/parquet/reader/DeltaBpDecoder.h"
@@ -26,8 +28,17 @@ namespace facebook::velox::parquet {
 // https://github.com/apache/arrow/blob/apache-arrow-15.0.0/cpp/src/parquet/encoding.cc#L2758-L2889
 class DeltaLengthByteArrayDecoder {
  public:
+  DeltaLengthByteArrayDecoder() = default;
+
   explicit DeltaLengthByteArrayDecoder(const char* start) {
-    lengthDecoder_ = std::make_unique<DeltaBpDecoder>(start);
+    reset(start);
+  }
+
+  // Re-initialize the decoder for a new page. Reuses the existing
+  // bufferedLength_ vector capacity; only allocates if numLength
+  // exceeds it.
+  void reset(const char* start) {
+    lengthDecoder_.emplace(start);
     decodeLengths();
     bufferStart_ = lengthDecoder_->bufferStart();
   }
@@ -44,10 +55,8 @@ class DeltaLengthByteArrayDecoder {
   }
 
   template <bool hasNulls>
-  FOLLY_ALWAYS_INLINE void skip(
-      int32_t numValues,
-      int32_t current,
-      const uint64_t* nulls) {
+  FOLLY_ALWAYS_INLINE void
+  skip(int32_t numValues, int32_t current, const uint64_t* nulls) {
     if (hasNulls) {
       numValues = bits::countNonNulls(nulls, current, current + numValues);
     }
@@ -103,7 +112,7 @@ class DeltaLengthByteArrayDecoder {
   }
 
   const char* bufferStart_;
-  std::unique_ptr<DeltaBpDecoder> lengthDecoder_;
+  std::optional<DeltaBpDecoder> lengthDecoder_;
   int32_t numValidValues_{0};
   uint32_t lengthIdx_{0};
   std::vector<uint32_t> bufferedLength_;
@@ -113,17 +122,31 @@ class DeltaLengthByteArrayDecoder {
 // https://github.com/apache/arrow/blob/apache-arrow-15.0.0/cpp/src/parquet/encoding.cc#L3301-L3545
 class DeltaByteArrayDecoder {
  public:
+  DeltaByteArrayDecoder() = default;
+
   explicit DeltaByteArrayDecoder(const char* start) {
-    prefixLenDecoder_ = std::make_unique<DeltaBpDecoder>(start);
+    reset(start);
+  }
+
+  // Re-initialize the decoder for a new page. Reuses the existing
+  // bufferedPrefixLength_, lastValueBuf_, and the embedded
+  // suffixDecoder_'s buffers; only allocates if their capacities are
+  // insufficient.
+  void reset(const char* start) {
+    prefixLenDecoder_.emplace(start);
     int64_t numPrefix = prefixLenDecoder_->validValuesCount();
     bufferedPrefixLength_.resize(numPrefix);
     prefixLenDecoder_->readValues<uint32_t>(
         bufferedPrefixLength_.data(), static_cast<int32_t>(numPrefix));
     prefixLenOffset_ = 0;
     numValidValues_ = static_cast<int32_t>(numPrefix);
+    lastValueLen_ = 0;
 
-    suffixDecoder_ = std::make_unique<DeltaLengthByteArrayDecoder>(
-        prefixLenDecoder_->bufferStart());
+    if (!suffixDecoder_.has_value()) {
+      suffixDecoder_.emplace(prefixLenDecoder_->bufferStart());
+    } else {
+      suffixDecoder_->reset(prefixLenDecoder_->bufferStart());
+    }
   }
 
   FOLLY_ALWAYS_INLINE std::string_view readString() {
@@ -158,10 +181,8 @@ class DeltaByteArrayDecoder {
   }
 
   template <bool hasNulls>
-  FOLLY_ALWAYS_INLINE void skip(
-      int32_t numValues,
-      int32_t current,
-      const uint64_t* nulls) {
+  FOLLY_ALWAYS_INLINE void
+  skip(int32_t numValues, int32_t current, const uint64_t* nulls) {
     if (hasNulls) {
       numValues = bits::countNonNulls(nulls, current, current + numValues);
     }
@@ -206,9 +227,8 @@ class DeltaByteArrayDecoder {
   }
 
  private:
-  std::unique_ptr<DeltaBpDecoder> prefixLenDecoder_;
-  std::unique_ptr<DeltaBpDecoder> suffixLenDecoder_;
-  std::unique_ptr<DeltaLengthByteArrayDecoder> suffixDecoder_;
+  std::optional<DeltaBpDecoder> prefixLenDecoder_;
+  std::optional<DeltaLengthByteArrayDecoder> suffixDecoder_;
 
   // Reconstructed value of the most recently returned string. The
   // returned string_view aliases this buffer; the next call to

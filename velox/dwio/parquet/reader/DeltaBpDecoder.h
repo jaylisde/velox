@@ -36,10 +36,8 @@ class DeltaBpDecoder {
   }
 
   template <bool hasNulls>
-  FOLLY_ALWAYS_INLINE void skip(
-      int32_t numValues,
-      int32_t current,
-      const uint64_t* nulls) {
+  FOLLY_ALWAYS_INLINE void
+  skip(int32_t numValues, int32_t current, const uint64_t* nulls) {
     if (hasNulls) {
       numValues = bits::countNonNulls(nulls, current, current + numValues);
     }
@@ -53,11 +51,8 @@ class DeltaBpDecoder {
     int32_t current = visitor.start();
     skip<hasNulls>(current, 0, nulls);
     if constexpr (
-        !hasNulls &&
-        Visitor::FilterType::deterministic &&
-        std::is_same_v<
-            typename Visitor::HookType,
-            dwio::common::NoHook> &&
+        !hasNulls && Visitor::FilterType::deterministic &&
+        std::is_same_v<typename Visitor::HookType, dwio::common::NoHook> &&
         std::is_integral_v<typename Visitor::DataType>) {
       // Detect at runtime whether the row range is actually contiguous
       // (rows[i] == rows[0]+i) even when the visitor's static isDense
@@ -141,9 +136,9 @@ class DeltaBpDecoder {
   template <typename Visitor>
   void readWithVisitorDenseBatched(Visitor& visitor) {
     using DataType = typename Visitor::DataType;
-    constexpr bool kHasFilter = !std::is_same_v<
-        typename Visitor::FilterType,
-        velox::common::AlwaysTrue>;
+    constexpr bool kHasFilter =
+        !std::
+            is_same_v<typename Visitor::FilterType, velox::common::AlwaysTrue>;
     constexpr int32_t kBatch = 256;
     const int32_t total = visitor.numRows();
     DataType* output = visitor.rawValues(total);
@@ -154,7 +149,10 @@ class DeltaBpDecoder {
       const int32_t n = std::min<int32_t>(kBatch, total - consumed);
       DataType* dst = output + numValues;
       decodeLongs(dst, n);
-      visitor.template processRun<kHasFilter, /*hasHook=*/false, /*scatter=*/false>(
+      visitor.template processRun<
+          kHasFilter,
+          /*hasHook=*/false,
+          /*scatter=*/false>(
           dst,
           n,
           /*scatterRows=*/nullptr,
@@ -183,8 +181,7 @@ class DeltaBpDecoder {
     int64_t lastValue = lastValue_;
     int64_t minDelta = minDelta_;
     uint64_t deltaBitWidth = deltaBitWidth_;
-    uint64_t bitOffset =
-        (valsPerMiniBlk - miniBlockRemaining) * deltaBitWidth;
+    uint64_t bitOffset = (valsPerMiniBlk - miniBlockRemaining) * deltaBitWidth;
 
     int32_t i = 0;
     while (i < n) {
@@ -201,8 +198,7 @@ class DeltaBpDecoder {
         lastValue = lastValue_;
         minDelta = minDelta_;
         deltaBitWidth = deltaBitWidth_;
-        bitOffset =
-            (valsPerMiniBlk - miniBlockRemaining) * deltaBitWidth;
+        bitOffset = (valsPerMiniBlk - miniBlockRemaining) * deltaBitWidth;
         ++i;
         continue;
       }

@@ -436,8 +436,7 @@ class ColumnVisitor {
       return;
     }
     if constexpr (
-        hasFilter && !hasHook && !scatter &&
-        TFilter::deterministic &&
+        hasFilter && !hasHook && !scatter && TFilter::deterministic &&
         (std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t> ||
          std::is_same_v<T, int16_t>)) {
       // Treat the caller-provided run as physically contiguous (the DELTA

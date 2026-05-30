@@ -1673,22 +1673,25 @@ TEST_F(ParquetTableScanTest, deltaBinaryPackedMixedMiniblockWidths) {
       facebook::velox::parquet::arrow::Encoding::kDeltaBinaryPacked;
 
   constexpr vector_size_t kSize = 128;
-  auto vector = makeRowVector(
-      {"c"}, {makeFlatVector<int64_t>(kSize, [](auto row) {
-        auto deltaForRow = [](vector_size_t r) -> int64_t {
-          const int mb = (r / 32) % 4;
-          const int parity = r % 2;
-          if (mb == 0) return parity;
-          if (mb == 1) return parity ? 200LL : 0LL;
-          if (mb == 2) return parity ? 50'000LL : 0LL;
-          return parity ? 12'000'000LL : 0LL;
-        };
-        int64_t v = 0;
-        for (vector_size_t i = 0; i < row; ++i) {
-          v += deltaForRow(i);
-        }
-        return v;
-      })});
+  auto vector =
+      makeRowVector({"c"}, {makeFlatVector<int64_t>(kSize, [](auto row) {
+                      auto deltaForRow = [](vector_size_t r) -> int64_t {
+                        const int mb = (r / 32) % 4;
+                        const int parity = r % 2;
+                        if (mb == 0)
+                          return parity;
+                        if (mb == 1)
+                          return parity ? 200LL : 0LL;
+                        if (mb == 2)
+                          return parity ? 50'000LL : 0LL;
+                        return parity ? 12'000'000LL : 0LL;
+                      };
+                      int64_t v = 0;
+                      for (vector_size_t i = 0; i < row; ++i) {
+                        v += deltaForRow(i);
+                      }
+                      return v;
+                    })});
   auto file = TempFilePath::create();
   writeToParquetFile(file->getPath(), {vector}, options);
   loadData(vector->rowType(), vector);

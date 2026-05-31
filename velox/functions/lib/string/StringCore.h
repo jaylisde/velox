@@ -264,22 +264,38 @@ applyAppendersRecursive(TOutStr& output, Func appenderFunc, Funcs... funcs) {
  */
 FOLLY_ALWAYS_INLINE int64_t
 lengthUnicode(const char* inputBuffer, size_t bufferLength) {
-  // First address after the last byte in the buffer
-  auto buffEndAddress = inputBuffer + bufferLength;
-  auto currentChar = inputBuffer;
-  int64_t size = 0;
-  while (currentChar < buffEndAddress) {
-    // This function detects bytes that come after the first byte in a
-    // multi-byte UTF-8 character (provided that the string is valid UTF-8). We
-    // increment size only for the first byte so that we treat all bytes as part
-    // of a single character.
-    if (!utf_cont(*currentChar)) {
-      size++;
-    }
+  // Character count equals the number of non-continuation bytes, i.e. bytes
+  // where (b & 0xC0) != 0x80. SIMD-count per block; scalar tail for remainder.
+  constexpr size_t kBatchSize = xsimd::batch<uint8_t>::size;
+  const auto* input = reinterpret_cast<const uint8_t*>(inputBuffer);
+  size_t position = 0;
+  int64_t numChars = 0;
 
-    currentChar++;
+  if (bufferLength >= kBatchSize) {
+    const auto highBitMask = xsimd::broadcast<uint8_t>(0x80);
+    const auto continuationMask = xsimd::broadcast<uint8_t>(0xc0);
+
+    while (position + kBatchSize <= bufferLength) {
+      auto batch = xsimd::batch<uint8_t>::load_unaligned(input + position);
+      if (LIKELY(!xsimd::any(batch >= highBitMask))) {
+        numChars += kBatchSize; // Pure ASCII block.
+      } else {
+        const auto isCharStart = (batch & continuationMask) != highBitMask;
+        const uint64_t mask =
+            static_cast<uint64_t>(simd::toBitMask(isCharStart));
+        numChars += __builtin_popcountll(mask);
+      }
+      position += kBatchSize;
+    }
   }
-  return size;
+
+  while (position < bufferLength) {
+    if (!utf_cont(static_cast<char>(input[position]))) {
+      numChars++;
+    }
+    position++;
+  }
+  return numChars;
 }
 
 namespace detail {

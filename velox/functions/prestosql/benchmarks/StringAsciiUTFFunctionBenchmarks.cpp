@@ -58,6 +58,31 @@ class StringAsciiUTFFunctionBenchmark
     doRun(exprSet, rowVector);
   }
 
+  void runLength(bool utf, size_t stringLength) {
+    folly::BenchmarkSuspender suspender;
+
+    VectorFuzzer::Options opts;
+    if (utf) {
+      opts.charEncodings.clear();
+      opts.charEncodings = {
+          UTF8CharList::UNICODE_CASE_SENSITIVE,
+          UTF8CharList::EXTENDED_UNICODE,
+          UTF8CharList::MATHEMATICAL_SYMBOLS};
+    }
+
+    opts.stringLength = stringLength;
+    opts.vectorSize = 100'000;
+    VectorFuzzer fuzzer(opts, execCtx_.pool());
+    auto vector = fuzzer.fuzzFlat(VARCHAR());
+
+    auto rowVector = vectorMaker_.rowVector({vector});
+    auto exprSet = compileExpression("length(c0)", rowVector->type());
+
+    suspender.dismiss();
+
+    doRun(exprSet, rowVector);
+  }
+
   void runSubStr(bool utf) {
     folly::BenchmarkSuspender suspender;
 
@@ -126,6 +151,26 @@ class StringAsciiUTFFunctionBenchmark
   }
 };
 
+BENCHMARK(utfLength_100) {
+  StringAsciiUTFFunctionBenchmark benchmark;
+  benchmark.runLength(true, 100);
+}
+
+BENCHMARK_RELATIVE(asciiLength_100) {
+  StringAsciiUTFFunctionBenchmark benchmark;
+  benchmark.runLength(false, 100);
+}
+
+BENCHMARK(utfLength_1024) {
+  StringAsciiUTFFunctionBenchmark benchmark;
+  benchmark.runLength(true, 1024);
+}
+
+BENCHMARK_RELATIVE(asciiLength_1024) {
+  StringAsciiUTFFunctionBenchmark benchmark;
+  benchmark.runLength(false, 1024);
+}
+
 BENCHMARK(utfLower) {
   StringAsciiUTFFunctionBenchmark benchmark;
   benchmark.runUpperLower("lower", true);
@@ -189,6 +234,8 @@ BENCHMARK_RELATIVE(aciiRPad) {
 //============================================================================
 int main(int argc, char** argv) {
   folly::Init init{&argc, &argv};
+  facebook::velox::memory::MemoryManager::initialize(
+      facebook::velox::memory::MemoryManager::Options{});
 
   folly::runBenchmarks();
   return 0;

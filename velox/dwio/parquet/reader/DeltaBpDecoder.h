@@ -19,6 +19,8 @@
 #include "velox/common/base/BitUtil.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/base/Nulls.h"
+#include "velox/dwio/common/DecoderUtil.h"
+#include "velox/type/Filter.h"
 
 namespace facebook::velox::parquet {
 
@@ -54,6 +56,13 @@ class DeltaBpDecoder {
         std::is_same_v<typename Visitor::HookType, dwio::common::NoHook> &&
         std::is_integral_v<typename Visitor::DataType>) {
       readWithVisitorDenseBatched(visitor);
+      return;
+    }
+    if constexpr (
+        !Visitor::dense && !hasNulls && Visitor::FilterType::deterministic &&
+        std::is_same_v<typename Visitor::HookType, dwio::common::NoHook> &&
+        std::is_integral_v<typename Visitor::DataType>) {
+      readWithVisitorSparseBuffered(visitor);
       return;
     }
     int32_t toSkip;
@@ -116,7 +125,7 @@ class DeltaBpDecoder {
     constexpr bool kHasFilter =
         !std::
             is_same_v<typename Visitor::FilterType, velox::common::AlwaysTrue>;
-    constexpr int32_t kBatch = 256;
+    constexpr int32_t kBatch = 1024;
     const int32_t total = visitor.numRows();
     DataType* output = visitor.rawValues(total);
     int32_t* filterHits = kHasFilter ? visitor.outputRows(total) : nullptr;
@@ -141,8 +150,53 @@ class DeltaBpDecoder {
     visitor.setNumValues(numValues);
   }
 
+  // Sparse + deterministic-filter + NoHook + integral DataType fast
+  // path. DELTA's delta-chain forces every physical row to be decoded
+  // even when the row set is sparse, so we batch the decode side into
+  // a stack buffer and run visitor.process() scalar over the buffer
+  // (buffer index instead of readLong() per row).
+  template <typename Visitor>
+  void readWithVisitorSparseBuffered(Visitor& visitor) {
+    using DataType = typename Visitor::DataType;
+    constexpr int32_t kBatch = 1024;
+    DataType buf[kBatch];
+
+    const auto* rows = visitor.rows();
+    const int32_t numRows = visitor.numRows();
+    int32_t rowIdx = 0;
+    int32_t currentPhys = (numRows > 0) ? rows[0] : 0;
+    bool atEnd = false;
+    while (!atEnd && rowIdx < numRows) {
+      const int32_t remaining = static_cast<int32_t>(totalValuesRemaining_);
+      if (remaining <= 0) {
+        return;
+      }
+      // Cap n to the visitor's residual physical span; decoding past it
+      // would leave the decoder at the wrong physical position and
+      // misalign the next readWithVisitor call.
+      const int32_t lastRow = rows[numRows - 1];
+      const int32_t maxSpan = lastRow - currentPhys + 1;
+      const int32_t n = std::min<int32_t>({kBatch, remaining, maxSpan});
+      decodeLongs(buf, n);
+      const int32_t batchPhysStart = currentPhys;
+      const int32_t batchPhysEnd = currentPhys + n; // exclusive
+      currentPhys = batchPhysEnd;
+      while (rowIdx < numRows && rows[rowIdx] < batchPhysEnd) {
+        const int32_t i = rows[rowIdx] - batchPhysStart;
+        visitor.process(buf[i], atEnd);
+        ++rowIdx;
+        if (atEnd) {
+          return;
+        }
+      }
+    }
+  }
+
   // Inlined readLong() with state hoisted to locals; advances a running
-  // bitOffset to avoid a multiply per row. DataType narrowing covers int32.
+  // bitOffset to avoid a multiply per row. Whole bit-aligned miniblocks
+  // dispatch to decodeMiniBlockSimd(); the scalar tail handles partial
+  // miniblocks, bit_width > 32, and the page's first (header) value.
+  // DataType narrowing covers int32.
   template <typename DataType>
   void decodeLongs(DataType* out, int32_t n) {
     const char* bufStart = bufferStart_;
@@ -157,21 +211,113 @@ class DeltaBpDecoder {
     int32_t i = 0;
     while (i < n) {
       if (miniBlockRemaining == 0) {
+        // Refill the miniblock. Two distinct cases:
+        //   1. The very first value of the page lives in the page
+        //      header (lastValue_), not in a packed miniblock. Emit
+        //      it and initialize the first block if there is one.
+        //   2. Subsequent miniblocks: advance to the next miniblock
+        //      (or new block) but DO NOT consume any value. Leaves
+        //      miniBlockRemaining = valsPerMiniBlk so the SIMD fast
+        //      path below can swallow the whole miniblock.
+        if (!firstBlockInitialized_) {
+          bufferStart_ = bufStart;
+          valuesRemainingCurrentMiniBlock_ = 0;
+          totalValuesRemaining_ = totalRemaining;
+          lastValue_ = lastValue;
+          int64_t v = readLong();
+          out[i] = static_cast<DataType>(v);
+          bufStart = bufferStart_;
+          miniBlockRemaining = valuesRemainingCurrentMiniBlock_;
+          totalRemaining = totalValuesRemaining_;
+          lastValue = lastValue_;
+          minDelta = minDelta_;
+          deltaBitWidth = deltaBitWidth_;
+          bitOffset = (valsPerMiniBlk - miniBlockRemaining) * deltaBitWidth;
+          ++i;
+          continue;
+        }
         bufferStart_ = bufStart;
         valuesRemainingCurrentMiniBlock_ = 0;
         totalValuesRemaining_ = totalRemaining;
         lastValue_ = lastValue;
-        int64_t v = readLong();
-        out[i] = static_cast<DataType>(v);
+        advanceMiniBlock();
         bufStart = bufferStart_;
         miniBlockRemaining = valuesRemainingCurrentMiniBlock_;
-        totalRemaining = totalValuesRemaining_;
-        lastValue = lastValue_;
         minDelta = minDelta_;
         deltaBitWidth = deltaBitWidth_;
-        bitOffset = (valsPerMiniBlk - miniBlockRemaining) * deltaBitWidth;
-        ++i;
-        continue;
+        bitOffset = 0;
+      }
+
+      // Whole-miniblock SIMD fast path. Eligibility:
+      //   - We are at the miniblock start (bit-aligned, full count
+      //     remaining).
+      //   - The whole miniblock fits within the requested chunk and
+      //     the remaining page values.
+      //   - bit_width <= 32: an inline kernel materialized for each
+      //     compile-time bit width handles the unpack. Widths 33..64
+      //     fall through to the per-row scalar inner loop. Width 0
+      //     is a constant-stride arithmetic sequence (no bit-extract
+      //     needed).
+      if (miniBlockRemaining == valsPerMiniBlk &&
+          static_cast<uint64_t>(n - i) >= valsPerMiniBlk &&
+          totalRemaining >= valsPerMiniBlk && deltaBitWidth <= 32) {
+        const int32_t mbValues = static_cast<int32_t>(valsPerMiniBlk);
+        DataType* dst = out + i;
+        bool dispatched = true;
+        switch (deltaBitWidth) {
+          case 0:
+            decodeMiniBlockConstantDelta(mbValues, minDelta, lastValue, dst);
+            break;
+#define VELOX_DELTA_BP_DISPATCH(bw)                    \
+  case bw:                                             \
+    decodeMiniBlockSimdImpl<DataType, bw>(             \
+        bufStart, mbValues, minDelta, lastValue, dst); \
+    break;
+            VELOX_DELTA_BP_DISPATCH(1)
+            VELOX_DELTA_BP_DISPATCH(2)
+            VELOX_DELTA_BP_DISPATCH(3)
+            VELOX_DELTA_BP_DISPATCH(4)
+            VELOX_DELTA_BP_DISPATCH(5)
+            VELOX_DELTA_BP_DISPATCH(6)
+            VELOX_DELTA_BP_DISPATCH(7)
+            VELOX_DELTA_BP_DISPATCH(8)
+            VELOX_DELTA_BP_DISPATCH(9)
+            VELOX_DELTA_BP_DISPATCH(10)
+            VELOX_DELTA_BP_DISPATCH(11)
+            VELOX_DELTA_BP_DISPATCH(12)
+            VELOX_DELTA_BP_DISPATCH(13)
+            VELOX_DELTA_BP_DISPATCH(14)
+            VELOX_DELTA_BP_DISPATCH(15)
+            VELOX_DELTA_BP_DISPATCH(16)
+            VELOX_DELTA_BP_DISPATCH(17)
+            VELOX_DELTA_BP_DISPATCH(18)
+            VELOX_DELTA_BP_DISPATCH(19)
+            VELOX_DELTA_BP_DISPATCH(20)
+            VELOX_DELTA_BP_DISPATCH(21)
+            VELOX_DELTA_BP_DISPATCH(22)
+            VELOX_DELTA_BP_DISPATCH(23)
+            VELOX_DELTA_BP_DISPATCH(24)
+            VELOX_DELTA_BP_DISPATCH(25)
+            VELOX_DELTA_BP_DISPATCH(26)
+            VELOX_DELTA_BP_DISPATCH(27)
+            VELOX_DELTA_BP_DISPATCH(28)
+            VELOX_DELTA_BP_DISPATCH(29)
+            VELOX_DELTA_BP_DISPATCH(30)
+            VELOX_DELTA_BP_DISPATCH(31)
+            VELOX_DELTA_BP_DISPATCH(32)
+#undef VELOX_DELTA_BP_DISPATCH
+          default:
+            dispatched = false;
+        }
+        if (dispatched) {
+          bufStart += bits::nbytes(deltaBitWidth * valsPerMiniBlk);
+          const uint64_t consumed = valsPerMiniBlk;
+          miniBlockRemaining = 0;
+          totalRemaining -= consumed;
+          i += static_cast<int32_t>(consumed);
+          bitOffset = 0;
+          continue;
+        }
       }
 
       uint64_t value = 0;
@@ -202,6 +348,90 @@ class DeltaBpDecoder {
     lastValue_ = lastValue;
   }
 
+  /// Decode one whole miniblock with prefix-sum fused into the
+  /// bit-extract loop. All arithmetic is unsigned mod-2^64 (Parquet
+  /// spec). Safety: the unpack reads up to 7 bytes past the last
+  /// miniblock byte; PageReader::readBytes guarantees
+  /// kPageReadPadding (8) trailing bytes, and intra-page overshoots
+  /// fall into the next miniblock — both valid memory.
+  template <typename DataType, uint8_t bitWidth>
+  FOLLY_ALWAYS_INLINE void decodeMiniBlockSimdImpl(
+      const char* src,
+      int32_t numValues,
+      int64_t minDelta,
+      int64_t& lastValue,
+      DataType* out) {
+    static_assert(bitWidth >= 1 && bitWidth <= 32);
+    constexpr uint64_t mask =
+        (bitWidth == 32) ? 0xFFFFFFFFULL : ((1ULL << bitWidth) - 1);
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(src);
+    uint64_t cumulative = static_cast<uint64_t>(lastValue);
+    const uint64_t step = static_cast<uint64_t>(minDelta);
+    if constexpr (bitWidth <= 16) {
+      // Process 4 values per iteration. A single unaligned 64-bit
+      // load holds at least 4 values for any bitWidth in [1..16]
+      // (4*bw <= 64). All 4 values come from one load + one shift.
+      for (int32_t i = 0; i < numValues; i += 4) {
+        const int32_t bitPos = i * bitWidth;
+        const int32_t byteOff = bitPos >> 3;
+        const int32_t bitInByte = bitPos & 7;
+        const uint64_t word =
+            *reinterpret_cast<const uint64_t*>(p + byteOff) >> bitInByte;
+        cumulative += step + (word & mask);
+        out[i + 0] = static_cast<DataType>(cumulative);
+        cumulative += step + ((word >> bitWidth) & mask);
+        out[i + 1] = static_cast<DataType>(cumulative);
+        cumulative += step + ((word >> (2 * bitWidth)) & mask);
+        out[i + 2] = static_cast<DataType>(cumulative);
+        cumulative += step + ((word >> (3 * bitWidth)) & mask);
+        out[i + 3] = static_cast<DataType>(cumulative);
+      }
+    } else {
+      // bitWidth in [17..32]: 2 values per iteration. After shifting
+      // by bitInByte (0..7), 2*bw + bitInByte can reach 71 bits, past
+      // a u64 window. Use __uint128_t for the unaligned load — on
+      // x86_64 this lowers to two u64 loads and a SHRD-style funnel
+      // shift, with no branch on bitInByte. The trailing u64 read
+      // (byteOff + 8) is always safe: intra-page it falls into the
+      // next miniblock; at page end the kPageReadPadding (8) bytes
+      // cover it.
+      for (int32_t i = 0; i < numValues; i += 2) {
+        const int32_t bitPos = i * bitWidth;
+        const int32_t byteOff = bitPos >> 3;
+        const int32_t bitInByte = bitPos & 7;
+        const __uint128_t window =
+            static_cast<__uint128_t>(
+                *reinterpret_cast<const uint64_t*>(p + byteOff)) |
+            (static_cast<__uint128_t>(
+                 *reinterpret_cast<const uint64_t*>(p + byteOff + 8))
+             << 64);
+        const uint64_t word = static_cast<uint64_t>(window >> bitInByte);
+        cumulative += step + (word & mask);
+        out[i + 0] = static_cast<DataType>(cumulative);
+        cumulative += step + ((word >> bitWidth) & mask);
+        out[i + 1] = static_cast<DataType>(cumulative);
+      }
+    }
+    lastValue = static_cast<int64_t>(cumulative);
+  }
+
+  // Specialization for bit_width == 0: every value is constant-stride
+  // (lastValue + (i+1)*minDelta).
+  template <typename DataType>
+  FOLLY_ALWAYS_INLINE void decodeMiniBlockConstantDelta(
+      int32_t numValues,
+      int64_t minDelta,
+      int64_t& lastValue,
+      DataType* out) {
+    uint64_t cumulative = static_cast<uint64_t>(lastValue);
+    const uint64_t step = static_cast<uint64_t>(minDelta);
+    for (int32_t i = 0; i < numValues; ++i) {
+      cumulative += step;
+      out[i] = static_cast<DataType>(cumulative);
+    }
+    lastValue = static_cast<int64_t>(cumulative);
+  }
+
   bool getVlqInt(uint64_t& v);
 
   bool getZigZagVlqInt(int64_t& v);
@@ -211,6 +441,22 @@ class DeltaBpDecoder {
   void initBlock();
 
   void initMiniBlock(int32_t bitWidth);
+
+  // Advances to the next miniblock without consuming a value. Mirrors
+  // the inner branch of readLong()'s `valuesRemainingCurrentMiniBlock_
+  // == 0` case (post-firstBlockInitialized_) but stops short of
+  // decoding the first value, so callers that decode a whole miniblock
+  // in one shot (decodeLongs SIMD path) can pick it up cleanly.
+  void advanceMiniBlock() {
+    VELOX_DCHECK(firstBlockInitialized_);
+    VELOX_DCHECK_EQ(valuesRemainingCurrentMiniBlock_, 0);
+    ++miniBlockIdx_;
+    if (miniBlockIdx_ < miniBlocksPerBlock_) {
+      initMiniBlock(deltaBitWidths_[miniBlockIdx_]);
+    } else {
+      initBlock();
+    }
+  }
 
   FOLLY_ALWAYS_INLINE int64_t readLong() {
     int64_t value = 0;

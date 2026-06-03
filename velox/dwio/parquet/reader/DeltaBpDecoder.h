@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include <folly/Varint.h>
 #include "velox/common/base/BitUtil.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/base/Nulls.h"
@@ -36,7 +35,8 @@ class DeltaBpDecoder {
   }
 
   template <bool hasNulls>
-  inline void skip(int32_t numValues, int32_t current, const uint64_t* nulls) {
+  FOLLY_ALWAYS_INLINE void
+  skip(int32_t numValues, int32_t current, const uint64_t* nulls) {
     if (hasNulls) {
       numValues = bits::countNonNulls(nulls, current, current + numValues);
     }
@@ -49,6 +49,13 @@ class DeltaBpDecoder {
   void readWithVisitor(const uint64_t* nulls, Visitor visitor) {
     int32_t current = visitor.start();
     skip<hasNulls>(current, 0, nulls);
+    if constexpr (
+        Visitor::dense && !hasNulls && Visitor::FilterType::deterministic &&
+        std::is_same_v<typename Visitor::HookType, dwio::common::NoHook> &&
+        std::is_integral_v<typename Visitor::DataType>) {
+      readWithVisitorDenseBatched(visitor);
+      return;
+    }
     int32_t toSkip;
     bool atEnd = false;
     const bool allowNulls = hasNulls && visitor.allowNulls();
@@ -89,95 +96,123 @@ class DeltaBpDecoder {
   }
 
   template <typename T>
-  void readValues(T* values, int32_t numValues) {
+  FOLLY_ALWAYS_INLINE void readValues(T* values, int32_t numValues) {
     VELOX_DCHECK_LE(numValues, totalValuesRemaining_);
-    for (auto i = 0; i < numValues; i++) {
-      values[i] = T(readLong());
+    if constexpr (std::is_integral_v<T>) {
+      decodeLongs(values, numValues);
+    } else {
+      for (auto i = 0; i < numValues; i++) {
+        values[i] = T(readLong());
+      }
     }
   }
 
  private:
-  bool getVlqInt(uint64_t& v) {
-    uint64_t tmp = 0;
-    for (int i = 0; i < folly::kMaxVarintLength64; i++) {
-      uint8_t byte = *(bufferStart_++);
-      tmp |= static_cast<uint64_t>(byte & 0x7F) << (7 * i);
-      if ((byte & 0x80) == 0) {
-        v = tmp;
-        return true;
+  // Dense + integral + NoHook fast path: decode each chunk directly into
+  // visitor's output buffer, then dispatch one processRun() per chunk.
+  template <typename Visitor>
+  void readWithVisitorDenseBatched(Visitor& visitor) {
+    using DataType = typename Visitor::DataType;
+    constexpr bool kHasFilter =
+        !std::
+            is_same_v<typename Visitor::FilterType, velox::common::AlwaysTrue>;
+    constexpr int32_t kBatch = 256;
+    const int32_t total = visitor.numRows();
+    DataType* output = visitor.rawValues(total);
+    int32_t* filterHits = kHasFilter ? visitor.outputRows(total) : nullptr;
+    int32_t numValues = 0;
+    int32_t consumed = 0;
+    while (consumed < total) {
+      const int32_t n = std::min<int32_t>(kBatch, total - consumed);
+      DataType* dst = output + numValues;
+      decodeLongs(dst, n);
+      visitor.template processRun<
+          kHasFilter,
+          /*hasHook=*/false,
+          /*scatter=*/false>(
+          dst,
+          n,
+          /*scatterRows=*/nullptr,
+          filterHits,
+          output,
+          numValues);
+      consumed += n;
+    }
+    visitor.setNumValues(numValues);
+  }
+
+  // Inlined readLong() with state hoisted to locals; advances a running
+  // bitOffset to avoid a multiply per row. DataType narrowing covers int32.
+  template <typename DataType>
+  void decodeLongs(DataType* out, int32_t n) {
+    const char* bufStart = bufferStart_;
+    uint64_t valsPerMiniBlk = valuesPerMiniBlock_;
+    uint64_t miniBlockRemaining = valuesRemainingCurrentMiniBlock_;
+    uint64_t totalRemaining = totalValuesRemaining_;
+    int64_t lastValue = lastValue_;
+    int64_t minDelta = minDelta_;
+    uint64_t deltaBitWidth = deltaBitWidth_;
+    uint64_t bitOffset = (valsPerMiniBlk - miniBlockRemaining) * deltaBitWidth;
+
+    int32_t i = 0;
+    while (i < n) {
+      if (miniBlockRemaining == 0) {
+        bufferStart_ = bufStart;
+        valuesRemainingCurrentMiniBlock_ = 0;
+        totalValuesRemaining_ = totalRemaining;
+        lastValue_ = lastValue;
+        int64_t v = readLong();
+        out[i] = static_cast<DataType>(v);
+        bufStart = bufferStart_;
+        miniBlockRemaining = valuesRemainingCurrentMiniBlock_;
+        totalRemaining = totalValuesRemaining_;
+        lastValue = lastValue_;
+        minDelta = minDelta_;
+        deltaBitWidth = deltaBitWidth_;
+        bitOffset = (valsPerMiniBlk - miniBlockRemaining) * deltaBitWidth;
+        ++i;
+        continue;
       }
-    }
-    return false;
-  }
 
-  bool getZigZagVlqInt(int64_t& v) {
-    uint64_t u;
-    if (!getVlqInt(u)) {
-      return false;
-    }
-    v = (u >> 1) ^ (~(u & 1) + 1);
-    return true;
-  }
-
-  void initHeader() {
-    if (!getVlqInt(valuesPerBlock_) || !getVlqInt(miniBlocksPerBlock_) ||
-        !getVlqInt(totalValueCount_) || !getZigZagVlqInt(lastValue_)) {
-      VELOX_FAIL("initHeader EOF");
-    }
-
-    VELOX_CHECK_GT(valuesPerBlock_, 0, "cannot have zero value per block");
-    VELOX_CHECK_EQ(
-        valuesPerBlock_ % 128,
-        0,
-        "the number of values in a block must be multiple of 128, but it's {}",
-        valuesPerBlock_);
-    VELOX_CHECK_GT(
-        miniBlocksPerBlock_, 0, "cannot have zero miniblock per block");
-    valuesPerMiniBlock_ = valuesPerBlock_ / miniBlocksPerBlock_;
-    VELOX_CHECK_GT(
-        valuesPerMiniBlock_, 0, "cannot have zero value per miniblock");
-    VELOX_CHECK_EQ(
-        valuesPerMiniBlock_ % 32,
-        0,
-        "the number of values in a miniblock must be multiple of 32, but it's {}",
-        valuesPerMiniBlock_);
-
-    totalValuesRemaining_ = totalValueCount_;
-    deltaBitWidths_.resize(miniBlocksPerBlock_);
-    firstBlockInitialized_ = false;
-    valuesRemainingCurrentMiniBlock_ = 0;
-  }
-
-  void initBlock() {
-    VELOX_DCHECK_GT(totalValuesRemaining_, 0, "initBlock called at EOF");
-
-    if (!getZigZagVlqInt(minDelta_)) {
-      VELOX_FAIL("initBlock EOF");
+      uint64_t value = 0;
+      if (deltaBitWidth) {
+        value = bits::detail::loadBits<uint64_t>(
+            reinterpret_cast<const uint64_t*>(bufStart),
+            bitOffset,
+            deltaBitWidth);
+        value &= (~0ULL >> (64 - deltaBitWidth));
+      }
+      uint64_t result = static_cast<uint64_t>(minDelta) + value +
+          static_cast<uint64_t>(lastValue);
+      lastValue = static_cast<int64_t>(result);
+      out[i] = static_cast<DataType>(result);
+      bitOffset += deltaBitWidth;
+      --miniBlockRemaining;
+      --totalRemaining;
+      if (miniBlockRemaining == 0 || totalRemaining == 0) {
+        bufStart += bits::nbytes(deltaBitWidth * valsPerMiniBlk);
+        bitOffset = 0;
+      }
+      ++i;
     }
 
-    // read the bitwidth of each miniblock
-    for (uint32_t i = 0; i < miniBlocksPerBlock_; ++i) {
-      deltaBitWidths_[i] = *(bufferStart_++);
-      // Note that non-conformant bitwidth entries are allowed by the Parquet
-      // spec for extraneous miniblocks in the last block (GH-14923), so we
-      // check the bitwidths when actually using them (see initMiniBlock()).
-    }
-
-    miniBlockIdx_ = 0;
-    firstBlockInitialized_ = true;
-    initMiniBlock(deltaBitWidths_[0]);
+    bufferStart_ = bufStart;
+    valuesRemainingCurrentMiniBlock_ = miniBlockRemaining;
+    totalValuesRemaining_ = totalRemaining;
+    lastValue_ = lastValue;
   }
 
-  void initMiniBlock(int32_t bitWidth) {
-    VELOX_DCHECK_LE(
-        bitWidth,
-        kMaxDeltaBitWidth,
-        "delta bit width larger than integer bit width");
-    deltaBitWidth_ = bitWidth;
-    valuesRemainingCurrentMiniBlock_ = valuesPerMiniBlock_;
-  }
+  bool getVlqInt(uint64_t& v);
 
-  int64_t readLong() {
+  bool getZigZagVlqInt(int64_t& v);
+
+  void initHeader();
+
+  void initBlock();
+
+  void initMiniBlock(int32_t bitWidth);
+
+  FOLLY_ALWAYS_INLINE int64_t readLong() {
     int64_t value = 0;
     if (valuesRemainingCurrentMiniBlock_ == 0) {
       if (!firstBlockInitialized_) {

@@ -408,6 +408,80 @@ class ColumnVisitor {
   inline void addNull();
   inline void addOutputRow(vector_size_t row);
 
+  /// Bulk variant of process() with two SIMD fast paths: AlwaysTrue
+  /// (counter-only) and deterministic integral filter (batch-filter via
+  /// processFixedFilter). All other cases fall back to a per-row loop.
+  template <bool hasFilter, bool hasHook, bool scatter>
+  FOLLY_ALWAYS_INLINE void processRun(
+      const T* input,
+      int32_t numInput,
+      const int32_t* scatterRows,
+      int32_t* filterHits,
+      T* values,
+      int32_t& numValues) {
+    DCHECK_EQ(input, values + numValues);
+    if constexpr (
+        !hasFilter && !hasHook && !scatter && isDense &&
+        std::is_same_v<TFilter, velox::common::AlwaysTrue>) {
+      rowIndex_ += numInput;
+      numValues += numInput;
+      return;
+    }
+    if constexpr (
+        hasFilter && !hasHook && !scatter && TFilter::deterministic &&
+        (std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t> ||
+         std::is_same_v<T, int16_t>)) {
+      const int32_t firstRow = currentRow();
+      constexpr int32_t kWidth = xsimd::batch<T>::size;
+      const int32_t numValuesAtEntry = numValues;
+      int32_t i = 0;
+      while (i + kWidth <= numInput) {
+        auto batch = xsimd::load_unaligned(input + i);
+        ::facebook::velox::dwio::common::processFixedFilter<
+            T,
+            /*filterOnly=*/false,
+            /*scatter=*/false,
+            /*dense=*/true>(
+            batch,
+            kWidth,
+            firstRow + i,
+            filter_,
+            [&](int32_t /*offset*/) {
+              return ::facebook::velox::simd::loadGatherIndices<T>(
+                  rows_ + rowIndex_ + i);
+            },
+            values,
+            filterHits,
+            numValues);
+        i += kWidth;
+      }
+      // Scalar tail uses process(), which appends through the reader's
+      // own numValues_ counter (not the local one). Sync the local SIMD
+      // count into the reader before the tail so process() lands at the
+      // next free slot, then sync the tail's appends back into the local
+      // counter so the surrounding setNumValues(numValues) commit covers
+      // them.
+      addNumValues(numValues - numValuesAtEntry);
+      rowIndex_ += i;
+      bool atEnd = false;
+      for (; i < numInput; ++i) {
+        process(input[i], atEnd);
+        if (atEnd) {
+          break;
+        }
+      }
+      numValues = reader_->numValues() - numValuesBias_;
+      return;
+    }
+    bool atEnd = false;
+    for (int32_t i = 0; i < numInput; ++i) {
+      process(input[i], atEnd);
+      if (atEnd) {
+        return;
+      }
+    }
+  }
+
   const TFilter& filter() {
     return filter_;
   }

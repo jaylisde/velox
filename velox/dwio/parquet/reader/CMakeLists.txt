@@ -14,6 +14,7 @@
 
 velox_add_library(
   velox_dwio_native_parquet_reader
+  DeltaBpDecoder.cpp
   Metadata.cpp
   NestedStructureDecoder.cpp
   ParquetReader.cpp
